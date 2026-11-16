@@ -457,6 +457,67 @@ def render(events: list, users: dict) -> list[str]:
     return blocks
 
 
+def tg_send_photo(png: bytes, caption: str, url: str = "") -> None:
+    """Send a rendered card into the Notion topic with an 'Open in Notion' button."""
+    global TG_CHAT_ID
+    if DRY_RUN:
+        n = len([f for f in os.listdir("/tmp") if f.startswith("dry_card")])
+        with open(f"/tmp/dry_card{n}.png", "wb") as f:
+            f.write(png)
+        print(f"---- CARD /tmp/dry_card{n}.png ---- {caption} {url}")
+        return
+    for attempt in range(5):
+        data = {"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+        if NOTION_THREAD:
+            data["message_thread_id"] = NOTION_THREAD
+        if url:
+            data["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": "Открыть в Notion", "url": url}]]})
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data=data,
+                          files={"photo": ("card.png", png, "image/png")}, timeout=60)
+        params = (r.json() if r.content else {}).get("parameters", {})
+        if r.status_code == 429:
+            time.sleep(params.get("retry_after", 5))
+            continue
+        if params.get("migrate_to_chat_id"):
+            TG_CHAT_ID = str(params["migrate_to_chat_id"])
+            continue
+        r.raise_for_status()
+        return
+
+
+def send_cards(events: list, users: dict) -> None:
+    """One branded image card per page; falls back to text if rendering fails."""
+    import cards  # local module; needs Pillow + fonts/
+
+    def nm(uid):
+        return who_name(uid, users)
+
+    bulk = defaultdict(list)
+    for e in events:
+        if e["kind"] == "create":
+            bulk[(e["who"], e["db"])].append(e)
+    collapsed = {k: v for k, v in bulk.items() if len(v) > COLLAPSE_AFTER}
+    skip = {id(e) for v in collapsed.values() for e in v}
+    pages, order = defaultdict(list), []
+    for e in events:
+        if id(e) in skip:
+            continue
+        if e["page"] not in pages:
+            order.append(e["page"])
+        pages[e["page"]].append(e)
+
+    for (who, db), items in collapsed.items():
+        png = cards.bulk_card(nm(who), len(items), db, [e["title"] for e in items])
+        tg_send_photo(png, f"<b>+{len(items)} записей</b>" + (f" · {esc(db)}" if db else ""))
+    for pid in order[:MAX_PAGES_PER_DIGEST]:
+        items = pages[pid]
+        head = items[-1]
+        png = cards.page_card(head["title"], head["db"], items, nm)
+        tg_send_photo(png, f"<b>{esc(clip(head['title'], 90))}</b>", head["url"])
+    if len(order) > MAX_PAGES_PER_DIGEST:
+        tg_send(f"<i>…и ещё {len(order) - MAX_PAGES_PER_DIGEST} страниц обновлено</i>")
+
+
 def tg_send_blocks(blocks: list[str]) -> None:
     sep = "\n\n· · ·\n\n"
     chunk = ""
@@ -581,7 +642,11 @@ def main() -> None:
     state = {"pages": new_prev, "comments": seen_comments, **meta}
 
     if events:
-        tg_send_blocks(render(events, users))
+        try:
+            send_cards(events, users)
+        except Exception as err:  # never lose an update because of drawing
+            print(f"cards failed ({type(err).__name__}), sending text")
+            tg_send_blocks(render(events, users))
 
     save_state(state)
     print(f"events sent: {len(events)}")
