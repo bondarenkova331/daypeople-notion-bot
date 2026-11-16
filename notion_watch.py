@@ -223,7 +223,7 @@ def process_updates(state: dict) -> None:
     if DRY_RUN:
         return
     data = tg_api("getUpdates", offset=state.get("tg_offset", 0), timeout=0,
-                  allowed_updates=["message", "my_chat_member"])
+                  allowed_updates=["message", "edited_message", "my_chat_member"])
     for u in data.get("result", []):
         state["tg_offset"] = u["update_id"] + 1
         mcm = u.get("my_chat_member") or {}
@@ -231,9 +231,18 @@ def process_updates(state: dict) -> None:
                 (mcm.get("new_chat_member") or {}).get("status") in ("member", "administrator"):
             if not os.environ.get("TELEGRAM_CHAT_ID"):
                 TG_CHAT_ID = str(mcm["chat"]["id"])
-        m = u.get("message") or {}
+        edited = "edited_message" in u
+        m = u.get("message") or u.get("edited_message") or {}
         if m.get("migrate_to_chat_id") and str(m["chat"]["id"]) == TG_CHAT_ID:
             TG_CHAT_ID = str(m["migrate_to_chat_id"])
+        if m.get("migrate_from_chat_id") and str(m["migrate_from_chat_id"]) == TG_CHAT_ID:
+            TG_CHAT_ID = str(m["chat"]["id"])
+        if str((m.get("chat") or {}).get("id")) == TG_CHAT_ID and m.get("is_topic_message"):
+            created = m.get("forum_topic_created") or (m.get("reply_to_message") or {}).get("forum_topic_created") or {}
+            if created.get("name", "").strip().lower() == "notion":
+                state["topic_notion"] = m.get("message_thread_id")
+        if edited:
+            continue
         if not TG_CHAT_ID and (m.get("chat") or {}).get("type") in ("group", "supergroup"):
             TG_CHAT_ID = str(m["chat"]["id"])
         if str((m.get("chat") or {}).get("id")) != TG_CHAT_ID:
@@ -247,6 +256,8 @@ def process_updates(state: dict) -> None:
         cmd = head[1:].split("@")[0].lower()
         reply = {"chat_id": TG_CHAT_ID, "reply_to_message_id": m["message_id"],
                  "parse_mode": "HTML", "disable_web_page_preview": True}
+        if m.get("is_topic_message"):
+            reply["message_thread_id"] = m.get("message_thread_id")
         if cmd in ("help", "start"):
             tg_api("sendMessage", text=HELP, **reply)
         elif cmd in COMMANDS:
@@ -317,19 +328,28 @@ def sync_avatar(state: dict) -> None:
         state["avatar"] = digest
 
 
+NOTION_THREAD = None  # forum topic "Notion" (message_thread_id), learned from updates
+
+
 def tg_send(text: str) -> None:
+    """Post to the group — into the "Notion" topic when the group has topics."""
+    global TG_CHAT_ID
     if DRY_RUN:
         print("---- TELEGRAM ----\n" + text)
         return
     for attempt in range(5):
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=30,
-        )
+        payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML",
+                   "disable_web_page_preview": True}
+        if NOTION_THREAD:
+            payload["message_thread_id"] = NOTION_THREAD
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json=payload, timeout=30)
+        params = (r.json() if r.content else {}).get("parameters", {})
         if r.status_code == 429:
-            time.sleep(r.json().get("parameters", {}).get("retry_after", 5))
+            time.sleep(params.get("retry_after", 5))
+            continue
+        if params.get("migrate_to_chat_id"):  # group became a supergroup
+            TG_CHAT_ID = str(params["migrate_to_chat_id"])
             continue
         r.raise_for_status()
         return
@@ -363,8 +383,8 @@ MAX_PAGES_PER_DIGEST = 12
 
 def who_name(uid, users: dict) -> str:
     full = users.get(uid) or ""
-    if not full:
-        return "Кто-то"
+    if not full or "telegram bot" in full.lower():
+        return ""  # unknown actor or our own integration — show the action without a name
     if full.lower() in NAMES:
         return NAMES[full.lower()]
     return full.split()[0]
@@ -395,7 +415,8 @@ def render(events: list, users: dict) -> list[str]:
 
     blocks = []
     for (who, db), items in collapsed.items():
-        lines = [f"📦 <b>{esc(who_name(who, users))}</b> добавил {len(items)} записей"
+        w = who_name(who, users)
+        lines = [(f"📦 <b>{esc(w)}</b> добавил {len(items)} записей" if w else f"📦 Добавлено {len(items)} записей")
                  + (f" в «{esc(db)}»" if db else "")]
         for e in items[:3]:
             lines.append(f"   • {link(e['title'], e['url'])}")
@@ -413,22 +434,23 @@ def render(events: list, users: dict) -> list[str]:
             lines.append(f"<i>{esc(head['db'])}</i>")
         lines.append("")
         for e in items:
-            name = f"<b>{esc(who_name(e['who'], users))}</b>"
+            who = who_name(e["who"], users)
+            name = f"<b>{esc(who)}</b>"
             if e["kind"] == "create":
-                lines.append(f"🆕 {name} создал страницу")
+                lines.append(f"🆕 {name} создал страницу" if who else "🆕 Новая страница")
             elif e["kind"] == "delete":
-                lines.append(f"🗑 {name} удалил страницу")
+                lines.append(f"🗑 {name} удалил страницу" if who else "🗑 Страница удалена")
             elif e["kind"] == "comment":
-                lines.append(f"💬 {name}")
+                lines.append(f"💬 {name or 'Комментарий'}")
                 lines.append(f"<blockquote>{esc(clip(e['text'], COMMENT_MAX))}</blockquote>")
             elif e["details"]:
-                lines.append(f"✏️ {name} изменил")
+                lines.append(f"✏️ {name} изменил" if who else "✏️ Изменено")
                 for field, a_, b_ in e["details"][:5]:
                     lines.append(f"      {esc(field)}:  {short(a_)}  →  <b>{short(b_)}</b>")
                 if len(e["details"]) > 5:
                     lines.append(f"      <i>и ещё {len(e['details']) - 5} полей</i>")
             else:
-                lines.append(f"✏️ {name} обновил текст")
+                lines.append(f"✏️ {name} обновил текст" if who else "✏️ Обновлён текст")
         blocks.append("\n".join(lines).rstrip())
     if len(order) > MAX_PAGES_PER_DIGEST:
         blocks.append(f"<i>…и ещё {len(order) - MAX_PAGES_PER_DIGEST} страниц обновлено</i>")
@@ -461,6 +483,8 @@ def main() -> None:
         print("bot is not in a group yet — add it to the group")
         return
     meta["chat"] = TG_CHAT_ID
+    global NOTION_THREAD
+    NOTION_THREAD = meta.get("topic_notion")
     ensure_commands(meta)
 
     users = {}
