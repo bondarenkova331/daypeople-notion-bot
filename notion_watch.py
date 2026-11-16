@@ -239,7 +239,7 @@ def process_updates(state: dict) -> None:
             TG_CHAT_ID = str(m["chat"]["id"])
         if str((m.get("chat") or {}).get("id")) == TG_CHAT_ID and m.get("is_topic_message"):
             created = m.get("forum_topic_created") or (m.get("reply_to_message") or {}).get("forum_topic_created") or {}
-            if created.get("name", "").strip().lower() == "notion":
+            if "notion" in created.get("name", "").lower():
                 state["topic_notion"] = m.get("message_thread_id")
         if edited:
             continue
