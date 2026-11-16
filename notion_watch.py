@@ -184,7 +184,8 @@ HELP = ("<b>Команды DAY PEOPLE</b>\n\n"
         "/gpt — задача для GPT\n"
         "/vitya · /dima — задача для Вити или Димы\n\n"
         "<i>Первая строка — название, дальше — описание. Пример:</i>\n"
-        "<code>/claude Пост про DJ Run\nЛёгкий тон, до 600 знаков</code>")
+        "<code>/claude Пост про DJ Run\nЛёгкий тон, до 600 знаков</code>\n\n"
+        "🎨 Всё, что пишешь в раздел «Референсы», бот сам переносит в Notion (👍 = записано).")
 
 
 def tg_api(method: str, **payload) -> dict:
@@ -217,6 +218,133 @@ def create_task(cmd: str, text: str, author: str) -> dict | None:
     return notion("POST", "/pages", json=payload)
 
 
+# ------------------------------------------------- 🎨 References → Notion
+# Every message in the Telegram topic "Референсы" is copied into Notion:
+# into the open task «Референсы…» (status ≠ Готово), else into the 🎨 Референсы page.
+REFS_PAGE = os.environ.get("REFS_PAGE_ID", "41a55b35194c814b8dedd98980356392")
+REFS_HEADING = "Референсы"
+
+
+def tg_entities_urls(text: str, entities: list | None) -> list[str]:
+    """Links in a Telegram message: plain URLs and hidden text links (offsets are UTF-16)."""
+    raw = text.encode("utf-16-le")
+    urls = []
+    for e in entities or []:
+        if e.get("type") == "text_link" and e.get("url"):
+            urls.append(e["url"])
+        elif e.get("type") == "url":
+            urls.append(raw[e["offset"] * 2:(e["offset"] + e["length"]) * 2].decode("utf-16-le"))
+    return list(dict.fromkeys(urls))
+
+
+def open_refs_task() -> str | None:
+    data = notion("POST", f"/databases/{TASKS_DB}/query", json={
+        "filter": {"and": [
+            {"property": "Задача", "title": {"starts_with": REFS_HEADING}},
+            {"property": "Статус", "status": {"does_not_equal": "Готово"}},
+        ]},
+        "sorts": [{"timestamp": "created_time", "direction": "descending"}],
+        "page_size": 1,
+    })
+    res = (data or {}).get("results") or []
+    return res[0]["id"] if res else None
+
+
+def refs_insert_after(page_id: str) -> str | None:
+    """Last block of the «Референсы» section (so new refs land there, not at the page end)."""
+    blocks = list(paginate("GET", f"/blocks/{page_id}/children"))
+    last, inside = None, False
+    for b in blocks:
+        t = b.get("type", "")
+        if t.startswith("heading_"):
+            if inside:
+                break
+            inside = plain(b[t].get("rich_text")).strip() == REFS_HEADING
+            if inside:
+                last = b["id"]
+            continue
+        if inside:
+            last = b["id"]
+    return last
+
+
+def tg_message_link(m: dict) -> str:
+    cid = str(m["chat"]["id"])
+    if not cid.startswith("-100"):
+        return ""
+    base = f"https://t.me/c/{cid[4:]}"
+    if m.get("is_topic_message") and m.get("message_thread_id"):
+        return f"{base}/{m['message_thread_id']}/{m['message_id']}"
+    return f"{base}/{m['message_id']}"
+
+
+def save_reference(m: dict, who: str) -> str | None:
+    """Append one reference to Notion. Returns the page id written to."""
+    text = (m.get("text") or m.get("caption") or "").strip()
+    urls = tg_entities_urls(text, m.get("entities") or m.get("caption_entities"))
+    media = next((n for k, n in (("photo", "фото"), ("video", "видео"), ("animation", "гиф"),
+                                 ("document", "файл"), ("video_note", "кружок")) if m.get(k)), "")
+    if not (text or urls or media):
+        return None
+    stamp = datetime.now(timezone(timedelta(hours=4))).strftime("%d.%m")
+    rich = [{"text": {"content": f"{who} · {stamp}"}, "annotations": {"bold": True}},
+            {"text": {"content": ":  "}}]
+    rest = text  # make URLs written in the text clickable in Notion
+    for u in sorted((u for u in urls if u in text), key=text.index):
+        head, _, rest = rest.partition(u)
+        if head:
+            rich.append({"text": {"content": head[:1900]}})
+        rich.append({"text": {"content": u[:1900], "link": {"url": u}}})
+    for i in range(0, len(rest), 1900):
+        rich.append({"text": {"content": rest[i:i + 1900]}})
+    for u in urls:
+        if u not in text:  # hidden link behind words — show it explicitly
+            rich.append({"text": {"content": f"  🔗 {clip(u, 60)}", "link": {"url": u}}})
+    if media:
+        rich.append({"text": {"content": f"{'  ' if text else ''}[{media} в Telegram]"},
+                     "annotations": {"italic": True, "color": "gray"}})
+    tlink = tg_message_link(m)
+    if tlink:
+        rich.append({"text": {"content": "  ↗ Telegram", "link": {"url": tlink}},
+                     "annotations": {"color": "gray"}})
+    children = [{"object": "block", "type": "bulleted_list_item",
+                 "bulleted_list_item": {"rich_text": rich[:100]}}]
+    target = open_refs_task() or REFS_PAGE
+    body = {"children": children}
+    after = refs_insert_after(target)
+    if after:
+        body["after"] = after
+    if not notion("PATCH", f"/blocks/{target}/children", json=body):
+        return None
+    return target
+
+
+def handle_reference(m: dict, state: dict) -> None:
+    group = m.get("media_group_id")
+    if group:  # an album arrives as several messages — save it once
+        seen = state.setdefault("ref_groups", [])
+        if group in seen and not m.get("caption"):
+            return
+        seen.append(group)
+        state["ref_groups"] = seen[-50:]
+    if not any(m.get(k) for k in ("text", "caption", "photo", "video", "animation", "document", "video_note")):
+        return  # service message
+    full = " ".join(filter(None, [m["from"].get("first_name"), m["from"].get("last_name")]))
+    who = NAMES.get(full.lower()) or m["from"].get("first_name") or "Telegram"
+    target = save_reference(m, who)
+    if target:
+        page = notion("GET", f"/pages/{target}") or {}
+        if page.get("last_edited_time"):  # our own write — don't echo it back as a Notion update
+            own = state.setdefault("own_edits", {})
+            own[target.replace("-", "")] = page["last_edited_time"]
+        tg_api("setMessageReaction", chat_id=TG_CHAT_ID, message_id=m["message_id"],
+               reaction=[{"type": "emoji", "emoji": "👍"}])
+    else:
+        tg_api("sendMessage", chat_id=TG_CHAT_ID, reply_to_message_id=m["message_id"],
+               message_thread_id=m.get("message_thread_id"),
+               text="⚠️ Не получилось записать референс в Notion")
+
+
 def process_updates(state: dict) -> None:
     """Read new Telegram updates: learn the group chat id and run /commands."""
     global TG_CHAT_ID
@@ -241,6 +369,8 @@ def process_updates(state: dict) -> None:
             created = m.get("forum_topic_created") or (m.get("reply_to_message") or {}).get("forum_topic_created") or {}
             if "notion" in created.get("name", "").lower():
                 state["topic_notion"] = m.get("message_thread_id")
+            if "референс" in created.get("name", "").lower():
+                state["topic_refs"] = m.get("message_thread_id")
         if edited:
             continue
         if not TG_CHAT_ID and (m.get("chat") or {}).get("type") in ("group", "supergroup"):
@@ -248,6 +378,11 @@ def process_updates(state: dict) -> None:
         if str((m.get("chat") or {}).get("id")) != TG_CHAT_ID:
             continue  # only our group may use commands
         text = m.get("text") or m.get("caption") or ""
+        if (not text.startswith("/") and state.get("topic_refs") and m.get("is_topic_message")
+                and m.get("message_thread_id") == state["topic_refs"]
+                and not (m.get("from") or {}).get("is_bot")):
+            handle_reference(m, state)
+            continue
         if not text.startswith("/"):
             continue
         head, _, rest = text.partition(" ")
@@ -596,6 +731,9 @@ def main() -> None:
         if cur["let"] == old["let"]:
             new_prev[pid] = old
             continue
+        if meta.get("own_edits", {}).get(pid.replace("-", "")) == cur["let"]:
+            new_prev[pid] = cur  # the bot itself added a reference here — nothing to announce
+            continue
         if cur["let"] and parse_ts(cur["let"]) > settled:
             new_prev[pid] = old  # still being edited — keep old snapshot, report later
             continue
@@ -638,6 +776,7 @@ def main() -> None:
             ev(pid, cur, "comment", (c.get("created_by") or {}).get("id"),
                text=plain(c.get("rich_text")))
     seen_comments = {k: v for k, v in seen_comments.items() if k in current}
+    meta["own_edits"] = dict(list(meta.get("own_edits", {}).items())[-50:])
 
     state = {"pages": new_prev, "comments": seen_comments, **meta}
 
