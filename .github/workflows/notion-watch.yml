@@ -40,6 +40,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: python notion_watch.py
 
+      - name: Group photo
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python group_photo.py || true
+
       - name: Save state
         if: hashFiles('state.enc') != ''
         uses: actions/cache/save@v4
