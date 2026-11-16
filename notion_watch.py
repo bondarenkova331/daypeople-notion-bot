@@ -167,21 +167,127 @@ def save_state(state: dict) -> None:
 
 
 # --------------------------------------------------------------- Telegram
-def find_group_chat() -> str:
-    """The group the bot was most recently added to (from getUpdates)."""
-    r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", timeout=30)
-    r.raise_for_status()
-    chat = ""
-    for u in r.json().get("result", []):
-        for key in ("my_chat_member", "message"):
-            c = (u.get(key) or {}).get("chat") or {}
-            if c.get("type") in ("group", "supergroup"):
-                chat = str(c["id"])
-            # a group upgraded to supergroup changes id
-            mig = (u.get("message") or {}).get("migrate_to_chat_id")
-            if mig:
-                chat = str(mig)
-    return chat
+TASKS_DB = os.environ.get("TASKS_DB_ID", "41855b35194c81f5b07fec124e05491f")
+COMMANDS = {
+    # command: (status, assignee, description for /help)
+    "task":   ("К выполнению", None,     "новая задача"),
+    "idea":   ("Идеи",         None,     "идея"),
+    "claude": ("К выполнению", "Claude", "задача для Claude"),
+    "gpt":    ("К выполнению", "GPT",    "задача для GPT"),
+    "vitya":  ("К выполнению", "Витя",   "задача для Вити"),
+    "dima":   ("К выполнению", "Дима",   "задача для Димы"),
+}
+HELP = ("<b>Команды бота DAY PEOPLE</b>\n"
+        + "\n".join(f"/{c} текст — {d[2]}" for c, d in COMMANDS.items())
+        + "\n\nПервая строка — название, остальное — описание. "
+          "Всё попадает в базу «Задачи» в Notion.")
+
+
+def tg_api(method: str, **payload) -> dict:
+    r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", json=payload, timeout=60)
+    if r.status_code == 429:
+        time.sleep(r.json().get("parameters", {}).get("retry_after", 5))
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", json=payload, timeout=60)
+    return r.json()
+
+
+def create_task(cmd: str, text: str, author: str) -> dict | None:
+    status, assignee, _ = COMMANDS[cmd]
+    lines = text.strip().split("\n", 1)
+    title = lines[0][:200]
+    body = lines[1].strip() if len(lines) > 1 else ""
+    stamp = datetime.now(timezone(timedelta(hours=4))).strftime("%d.%m")
+    to = assignee or "команда"
+    props = {
+        "Задача": {"title": [{"text": {"content": title}}]},
+        "Статус": {"status": {"name": status}},
+        "Передача": {"rich_text": [{"text": {"content": f"[{stamp} · {author} → {to}] из Telegram"}}]},
+    }
+    if assignee:
+        props["Исполнитель"] = {"select": {"name": assignee}}
+    payload = {"parent": {"database_id": TASKS_DB}, "properties": props}
+    if body:
+        payload["children"] = [{"object": "block", "type": "paragraph", "paragraph": {
+            "rich_text": [{"text": {"content": chunk}} for chunk in
+                          (body[i:i + 1900] for i in range(0, len(body), 1900))]}}]
+    return notion("POST", "/pages", json=payload)
+
+
+def process_updates(state: dict) -> None:
+    """Read new Telegram updates: learn the group chat id and run /commands."""
+    global TG_CHAT_ID
+    if DRY_RUN:
+        return
+    data = tg_api("getUpdates", offset=state.get("tg_offset", 0), timeout=0,
+                  allowed_updates=["message", "my_chat_member"])
+    for u in data.get("result", []):
+        state["tg_offset"] = u["update_id"] + 1
+        mcm = u.get("my_chat_member") or {}
+        if (mcm.get("chat") or {}).get("type") in ("group", "supergroup") and \
+                (mcm.get("new_chat_member") or {}).get("status") in ("member", "administrator"):
+            if not os.environ.get("TELEGRAM_CHAT_ID"):
+                TG_CHAT_ID = str(mcm["chat"]["id"])
+        m = u.get("message") or {}
+        if m.get("migrate_to_chat_id") and str(m["chat"]["id"]) == TG_CHAT_ID:
+            TG_CHAT_ID = str(m["migrate_to_chat_id"])
+        if not TG_CHAT_ID and (m.get("chat") or {}).get("type") in ("group", "supergroup"):
+            TG_CHAT_ID = str(m["chat"]["id"])
+        if str((m.get("chat") or {}).get("id")) != TG_CHAT_ID:
+            continue  # only our group may use commands
+        text = m.get("text") or m.get("caption") or ""
+        if not text.startswith("/"):
+            continue
+        head, _, rest = text.partition(" ")
+        if "\n" in head:
+            head, rest = head.split("\n", 1)[0], text.split("\n", 1)[1]
+        cmd = head[1:].split("@")[0].lower()
+        reply = {"chat_id": TG_CHAT_ID, "reply_to_message_id": m["message_id"],
+                 "parse_mode": "HTML", "disable_web_page_preview": True}
+        if cmd in ("help", "start"):
+            tg_api("sendMessage", text=HELP, **reply)
+        elif cmd in COMMANDS:
+            if not rest.strip():
+                tg_api("sendMessage", text=f"Напиши текст после команды: /{cmd} что сделать", **reply)
+                continue
+            who = " ".join(filter(None, [m["from"].get("first_name"), m["from"].get("last_name")])) or "Telegram"
+            page = create_task(cmd, rest, who)
+            if page:
+                state.setdefault("own_pages", []).append(page["id"])
+                state["own_pages"] = state["own_pages"][-300:]
+                title = rest.strip().split("\n", 1)[0]
+                tg_api("sendMessage", text=f"✅ В Notion: {link(title, page.get('url', ''))}", **reply)
+            else:
+                tg_api("sendMessage", text="⚠️ Не получилось записать в Notion", **reply)
+
+
+def ensure_commands(state: dict) -> None:
+    if DRY_RUN or state.get("commands_v") == 1:
+        return
+    cmds = [{"command": c, "description": d[2]} for c, d in COMMANDS.items()]
+    cmds.append({"command": "help", "description": "список команд"})
+    if tg_api("setMyCommands", commands=cmds).get("ok"):
+        state["commands_v"] = 1
+
+
+def sync_avatar(state: dict) -> None:
+    """Set the bot's profile photo from logo.jpg in the repo (once per file version)."""
+    path = "logo.jpg" if os.path.exists("logo.jpg") else None  # Telegram wants JPG
+    if not path or DRY_RUN:
+        return
+    with open(path, "rb") as f:
+        data = f.read()
+    digest = hashlib.sha256(data).hexdigest()
+    if state.get("avatar") == digest:
+        return
+    r = requests.post(
+        f"https://api.telegram.org/bot{TG_TOKEN}/setMyProfilePhoto",
+        data={"photo": json.dumps({"type": "static", "photo": "attach://logo"})},
+        files={"logo": ("logo.jpg", data, "image/jpeg")},
+        timeout=60,
+    )
+    print(f"avatar update: {r.status_code}")
+    if r.ok:
+        state["avatar"] = digest
 
 
 def tg_send(text: str) -> None:
@@ -236,11 +342,17 @@ def main() -> None:
     global TG_CHAT_ID
     now = datetime.now(timezone.utc)
     state = load_state()
+    meta = {k: v for k, v in (state or {}).items() if k not in ("pages", "comments")}
     if not TG_CHAT_ID:
-        TG_CHAT_ID = (state or {}).get("chat") or ("0" if DRY_RUN else find_group_chat())
-        if not TG_CHAT_ID:
-            print("bot is not in a group yet — add it to the group and write any message there")
-            return
+        TG_CHAT_ID = meta.get("chat") or ("0" if DRY_RUN else "")
+    process_updates(meta)
+    if not TG_CHAT_ID:
+        save_state({**(state or {}), **meta}) if state else None
+        print("bot is not in a group yet — add it to the group")
+        return
+    meta["chat"] = TG_CHAT_ID
+    sync_avatar(meta)
+    ensure_commands(meta)
 
     users = {}
     for u in paginate("GET", "/users"):
@@ -256,10 +368,10 @@ def main() -> None:
     print(f"visible objects: {len(current)}")
 
     if state is None:
-        state = {"pages": current, "comments": {}, "chat": TG_CHAT_ID}
+        state = {"pages": current, "comments": {}, **meta}
         save_state(state)
         tg_send(f"🤖 Бот DAY PEOPLE подключён. Слежу за {len(current)} страницами и базами в Notion "
-                f"и буду писать сюда обо всех изменениях.")
+                f"и буду писать сюда обо всех изменениях.\n\nЧтобы сразу добавить задачу или идею в Notion — /help")
         return
 
     prev = state["pages"]
@@ -274,6 +386,9 @@ def main() -> None:
     for pid, cur in current.items():
         old = prev.get(pid)
         if old is None:
+            if pid in meta.get("own_pages", []):
+                new_prev[pid] = cur
+                continue  # created by a bot command — already confirmed in the chat
             if cur["let"] and parse_ts(cur["let"]) > settled:
                 continue  # just created — wait until it has a title
             kind = "базу" if cur["k"] == "database" else "страницу"
@@ -343,7 +458,7 @@ def main() -> None:
     # forget comment bookkeeping for pages that are gone
     seen_comments = {k: v for k, v in seen_comments.items() if k in current}
 
-    state = {"pages": new_prev, "comments": seen_comments, "chat": TG_CHAT_ID}
+    state = {"pages": new_prev, "comments": seen_comments, **meta}
 
     if events:
         by_author = defaultdict(list)
