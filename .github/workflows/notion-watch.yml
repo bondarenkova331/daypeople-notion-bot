@@ -1,0 +1,60 @@
+name: notion-watch
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: notion-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # to save state cache and keep the schedule alive
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -q -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.enc
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Check Notion and notify
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python notion_watch.py
+
+      - name: Save state
+        if: hashFiles('state.enc') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.enc
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Drop old state caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key state- --sort created_at --order desc --limit 100 --json id -q '.[5:][].id' \
+            | xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Keep schedule alive (GitHub pauses idle schedules after 60 days)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/notion-watch.yml/enable" || true
