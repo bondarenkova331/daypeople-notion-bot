@@ -22,8 +22,8 @@ from datetime import datetime, timedelta, timezone
 import requests
 from cryptography.fernet import Fernet, InvalidToken
 
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
+TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")  # empty → found automatically
 # State is encrypted with a key derived from the Notion token (already secret).
 STATE_KEY = base64.urlsafe_b64encode(hashlib.sha256(b"daypeople-state:" + NOTION_TOKEN.encode()).digest())
@@ -489,6 +489,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if not (NOTION_TOKEN and TG_TOKEN):
+        print("secrets NOTION_TOKEN / TELEGRAM_BOT_TOKEN are not set yet — nothing to do")
+        raise SystemExit(0)
     try:
         main()
     except Exception as e:  # keep secrets/titles out of public logs
