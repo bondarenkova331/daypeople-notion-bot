@@ -269,13 +269,33 @@ def ensure_commands(state: dict) -> None:
         state["commands_v"] = 1
 
 
+def avatar_jpeg() -> bytes | None:
+    """Logo file from the repo → square JPG on white (Telegram crops avatars to a circle)."""
+    path = next((p for p in ("logo.jpg", "logo.png", "image.png") if os.path.exists(p)), None)
+    if not path:
+        return None
+    from io import BytesIO
+    from PIL import Image
+    im = Image.open(path).convert("RGBA")
+    box = im.getchannel("A").point(lambda a: 255 if a > 20 else 0).getbbox()
+    if box:
+        im = im.crop(box)
+    w, h = im.size
+    side = int(max(w, h) / 0.68)
+    canvas = Image.new("RGBA", (side, side), (255, 255, 255, 255))
+    canvas.alpha_composite(im, ((side - w) // 2, (side - h) // 2))
+    out = BytesIO()
+    canvas.convert("RGB").resize((640, 640), Image.LANCZOS).save(out, "JPEG", quality=95)
+    return out.getvalue()
+
+
 def sync_avatar(state: dict) -> None:
-    """Set the bot's profile photo from logo.jpg in the repo (once per file version)."""
-    path = "logo.jpg" if os.path.exists("logo.jpg") else None  # Telegram wants JPG
-    if not path or DRY_RUN:
+    """Set the bot's profile photo from the logo (once per logo version)."""
+    if DRY_RUN:
         return
-    with open(path, "rb") as f:
-        data = f.read()
+    data = avatar_jpeg()
+    if not data:
+        return
     digest = hashlib.sha256(data).hexdigest()
     if state.get("avatar") == digest:
         return
@@ -346,12 +366,12 @@ def main() -> None:
     if not TG_CHAT_ID:
         TG_CHAT_ID = meta.get("chat") or ("0" if DRY_RUN else "")
     process_updates(meta)
+    sync_avatar(meta)
     if not TG_CHAT_ID:
         save_state({**(state or {}), **meta}) if state else None
         print("bot is not in a group yet — add it to the group")
         return
     meta["chat"] = TG_CHAT_ID
-    sync_avatar(meta)
     ensure_commands(meta)
 
     users = {}
