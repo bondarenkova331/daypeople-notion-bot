@@ -177,10 +177,14 @@ COMMANDS = {
     "vitya":  ("К выполнению", "Витя",   "задача для Вити"),
     "dima":   ("К выполнению", "Дима",   "задача для Димы"),
 }
-HELP = ("<b>Команды бота DAY PEOPLE</b>\n"
-        + "\n".join(f"/{c} текст — {d[2]}" for c, d in COMMANDS.items())
-        + "\n\nПервая строка — название, остальное — описание. "
-          "Всё попадает в базу «Задачи» в Notion.")
+HELP = ("<b>Команды DAY PEOPLE</b>\n\n"
+        "/task — задача\n"
+        "/idea — идея\n"
+        "/claude — задача для Claude\n"
+        "/gpt — задача для GPT\n"
+        "/vitya · /dima — задача для Вити или Димы\n\n"
+        "<i>Первая строка — название, дальше — описание. Пример:</i>\n"
+        "<code>/claude Пост про DJ Run\nЛёгкий тон, до 600 знаков</code>")
 
 
 def tg_api(method: str, **payload) -> dict:
@@ -247,7 +251,7 @@ def process_updates(state: dict) -> None:
             tg_api("sendMessage", text=HELP, **reply)
         elif cmd in COMMANDS:
             if not rest.strip():
-                tg_api("sendMessage", text=f"Напиши текст после команды: /{cmd} что сделать", **reply)
+                tg_api("sendMessage", text=f"Напиши текст после команды, например:\n<code>/{cmd} Что сделать</code>", **reply)
                 continue
             who = " ".join(filter(None, [m["from"].get("first_name"), m["from"].get("last_name")])) or "Telegram"
             page = create_task(cmd, rest, who)
@@ -255,7 +259,10 @@ def process_updates(state: dict) -> None:
                 state.setdefault("own_pages", []).append(page["id"])
                 state["own_pages"] = state["own_pages"][-300:]
                 title = rest.strip().split("\n", 1)[0]
-                tg_api("sendMessage", text=f"✅ В Notion: {link(title, page.get('url', ''))}", **reply)
+                status, assignee, _ = COMMANDS[cmd]
+                meta_line = " · ".join(filter(None, [assignee, status]))
+                tg_api("sendMessage", text=f"✅ Добавил в Notion\n<b>{link(title, page.get('url', ''))}</b>\n"
+                                           f"<i>{esc(meta_line)}</i>", **reply)
             else:
                 tg_api("sendMessage", text="⚠️ Не получилось записать в Notion", **reply)
 
@@ -328,17 +335,6 @@ def tg_send(text: str) -> None:
         return
 
 
-def tg_send_long(lines: list[str]) -> None:
-    chunk = ""
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 3900:
-            tg_send(chunk)
-            chunk = ""
-        chunk += line + "\n"
-    if chunk.strip():
-        tg_send(chunk)
-
-
 # ------------------------------------------------------------------- main
 def esc(s: str) -> str:
     return html.escape(s, quote=False)
@@ -349,13 +345,106 @@ def link(title: str, url: str) -> str:
     return f'<a href="{html.escape(url)}">{t}</a>' if url else f"«{t}»"
 
 
-def short(v: str) -> str:
-    v = v or "—"
-    return esc(v if len(v) <= 60 else v[:57] + "…")
+def short(v) -> str:
+    return esc(clip(v or "—", 50))
 
 
 def parse_ts(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+NAMES = {  # how people are called in the chat
+    "viktor bondarenko": "Витя", "виктор бондаренко": "Витя", "artemiy vasilchuk": "Витя",
+    "дмитрий бабков": "Дима", "dmitry babkov": "Дима",
+}
+COMMENT_MAX = 280
+MAX_PAGES_PER_DIGEST = 12
+
+
+def who_name(uid, users: dict) -> str:
+    full = users.get(uid) or ""
+    if not full:
+        return "Кто-то"
+    if full.lower() in NAMES:
+        return NAMES[full.lower()]
+    return full.split()[0]
+
+
+def clip(t: str, n: int) -> str:
+    t = " ".join((t or "").split())
+    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
+
+
+def render(events: list, users: dict) -> list[str]:
+    """One block per Notion page; blank line between blocks; quotes for comments."""
+    # collapse bulk creations: same author, same database, many new pages
+    bulk = defaultdict(list)
+    for e in events:
+        if e["kind"] == "create":
+            bulk[(e["who"], e["db"])].append(e)
+    collapsed = {k: v for k, v in bulk.items() if len(v) > COLLAPSE_AFTER}
+    skip = {id(e) for v in collapsed.values() for e in v}
+
+    pages, order = defaultdict(list), []
+    for e in events:
+        if id(e) in skip:
+            continue
+        if e["page"] not in pages:
+            order.append(e["page"])
+        pages[e["page"]].append(e)
+
+    blocks = []
+    for (who, db), items in collapsed.items():
+        lines = [f"📦 <b>{esc(who_name(who, users))}</b> добавил {len(items)} записей"
+                 + (f" в «{esc(db)}»" if db else "")]
+        for e in items[:3]:
+            lines.append(f"   • {link(e['title'], e['url'])}")
+        if len(items) > 3:
+            lines.append(f"   <i>и ещё {len(items) - 3}</i>")
+        blocks.append("\n".join(lines))
+
+    for pid in order[:MAX_PAGES_PER_DIGEST]:
+        items = pages[pid]
+        head = items[-1]
+        title = (f"<b>{link(head['title'], head['url'])}</b>" if head["url"]
+                 else f"<b>{esc(clip(head['title'], 80))}</b>")
+        lines = [f"📄 {title}"]
+        if head["db"]:
+            lines.append(f"<i>{esc(head['db'])}</i>")
+        lines.append("")
+        for e in items:
+            name = f"<b>{esc(who_name(e['who'], users))}</b>"
+            if e["kind"] == "create":
+                lines.append(f"🆕 {name} создал страницу")
+            elif e["kind"] == "delete":
+                lines.append(f"🗑 {name} удалил страницу")
+            elif e["kind"] == "comment":
+                lines.append(f"💬 {name}")
+                lines.append(f"<blockquote>{esc(clip(e['text'], COMMENT_MAX))}</blockquote>")
+            elif e["details"]:
+                lines.append(f"✏️ {name} изменил")
+                for field, a_, b_ in e["details"][:5]:
+                    lines.append(f"      {esc(field)}:  {short(a_)}  →  <b>{short(b_)}</b>")
+                if len(e["details"]) > 5:
+                    lines.append(f"      <i>и ещё {len(e['details']) - 5} полей</i>")
+            else:
+                lines.append(f"✏️ {name} обновил текст")
+        blocks.append("\n".join(lines).rstrip())
+    if len(order) > MAX_PAGES_PER_DIGEST:
+        blocks.append(f"<i>…и ещё {len(order) - MAX_PAGES_PER_DIGEST} страниц обновлено</i>")
+    return blocks
+
+
+def tg_send_blocks(blocks: list[str]) -> None:
+    sep = "\n\n· · ·\n\n"
+    chunk = ""
+    for b in blocks:
+        if chunk and len(chunk) + len(sep) + len(b) > 3800:
+            tg_send(chunk)
+            chunk = ""
+        chunk = b if not chunk else chunk + sep + b
+    if chunk:
+        tg_send(chunk)
 
 
 def main() -> None:
@@ -396,11 +485,16 @@ def main() -> None:
 
     prev = state["pages"]
     seen_comments = state.get("comments", {})
-    events = []  # (author_id, action, where_db, line)
+    events = []  # dicts: page, title, url, db, kind, who, details, text
     settled = now - timedelta(minutes=SETTLE_MIN)
 
     def where(s):
         return db_titles.get(s.get("db")) or prev.get(s.get("db") or "", {}).get("t")
+
+    def ev(pid, snap, kind, who, details=None, text=None):
+        events.append({"page": pid, "title": snap["t"], "url": snap.get("u", ""),
+                       "db": where(snap), "kind": kind, "who": who,
+                       "details": details or [], "text": text})
 
     new_prev = {}
     for pid, cur in current.items():
@@ -411,9 +505,7 @@ def main() -> None:
                 continue  # created by a bot command — already confirmed in the chat
             if cur["let"] and parse_ts(cur["let"]) > settled:
                 continue  # just created — wait until it has a title
-            kind = "базу" if cur["k"] == "database" else "страницу"
-            events.append((cur["cby"] or cur["by"], "create", where(cur),
-                           f"🆕 создал {kind} {link(cur['t'], cur['u'])}"))
+            ev(pid, cur, "create", cur["cby"] or cur["by"])
             new_prev[pid] = cur
             continue
         if cur["let"] == old["let"]:
@@ -424,19 +516,12 @@ def main() -> None:
             continue
         details = []
         if cur["t"] != old["t"]:
-            details.append(f"название: {short(old['t'])} → {short(cur['t'])}")
+            details.append(("Название", old["t"], cur["t"]))
         for name in sorted(set(old["p"]) | set(cur["p"])):
-            a, b = old["p"].get(name), cur["p"].get(name)
-            if a != b and not (a in (None, "") and b in (None, "")):
-                details.append(f"{esc(name)}: {short(a)} → {short(b)}")
-        line = f"✏️ изменил {link(cur['t'], cur['u'])}"
-        if details:
-            line += "\n      " + "\n      ".join(details[:6])
-            if len(details) > 6:
-                line += f"\n      …и ещё {len(details) - 6}"
-        elif cur["k"] == "page":
-            line += " (текст)"
-        events.append((cur["by"], "edit", where(cur), line))
+            a_, b_ = old["p"].get(name), cur["p"].get(name)
+            if a_ != b_ and not (a_ in (None, "") and b_ in (None, "")):
+                details.append((name, a_, b_))
+        ev(pid, cur, "edit", cur["by"], details)
         new_prev[pid] = cur
 
     # Missing from search → confirm deletion directly (search can lag).
@@ -447,13 +532,7 @@ def main() -> None:
         if o and not (o.get("archived") or o.get("in_trash")):
             new_prev[pid] = old
             continue
-        who = (o or {}).get("last_edited_by", {}).get("id")
-        kind = "базу" if old["k"] == "database" else "страницу"
-        title = esc(old["t"])
-        if o is None:
-            events.append((None, "delete", where(old), f"🚫 закрыт доступ или удалена {kind} «{title}»"))
-        else:
-            events.append((who, "delete", where(old), f"🗑 удалил {kind} «{title}»"))
+        ev(pid, {**old, "u": ""}, "delete", (o or {}).get("last_edited_by", {}).get("id"))
 
     # Page-level comments on recently active pages.
     window = now - timedelta(days=COMMENT_WINDOW_DAYS)
@@ -471,38 +550,14 @@ def main() -> None:
         if pid not in prev:
             continue  # first time we see this page — just remember existing comments
         for c in fresh:
-            text = plain(c.get("rich_text"))
-            text = text if len(text) <= 200 else text[:197] + "…"
-            events.append(((c.get("created_by") or {}).get("id"), "comment", where(cur),
-                           f"💬 комментарий в {link(cur['t'], cur['u'])}:\n      «{esc(text)}»"))
-    # forget comment bookkeeping for pages that are gone
+            ev(pid, cur, "comment", (c.get("created_by") or {}).get("id"),
+               text=plain(c.get("rich_text")))
     seen_comments = {k: v for k, v in seen_comments.items() if k in current}
 
     state = {"pages": new_prev, "comments": seen_comments, **meta}
 
     if events:
-        by_author = defaultdict(list)
-        for author, action, db, line in events:
-            by_author[author].append((action, db, line))
-        out = []
-        for author, items in by_author.items():
-            out.append(f"<b>👤 {esc(users.get(author, 'Кто-то'))}</b>")
-            groups = defaultdict(list)
-            for action, db, line in items:
-                groups[(action, db)].append(line)
-            for (action, db), lines in groups.items():
-                if len(lines) > COLLAPSE_AFTER:
-                    verb = {"create": "создал", "edit": "изменил", "delete": "удалил",
-                            "comment": "оставил комментариев:"}[action]
-                    place = f" в «{esc(db)}»" if db else ""
-                    out.append(f"📦 {verb} {len(lines)} записей{place}, например:")
-                    out.extend("   " + l for l in lines[:3])
-                else:
-                    suffix = f"  <i>· {esc(db)}</i>" if db else ""
-                    out.extend(l.replace("\n", suffix + "\n", 1) if "\n" in l else l + suffix
-                               for l in lines)
-            out.append("")
-        tg_send_long(out)
+        tg_send_blocks(render(events, users))
 
     save_state(state)
     print(f"events sent: {len(events)}")
