@@ -1,8 +1,10 @@
 name: notion-watch
 
+# One run stays alive ~55 min, checking Notion and Telegram commands every minute,
+# then starts the next run itself. The schedule only restarts the chain if it ever breaks.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -11,12 +13,12 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write   # to save state cache and keep the schedule alive
+  actions: write   # save state cache, restart itself, keep the schedule alive
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
 
@@ -34,26 +36,33 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: state-
 
-      - name: Check Notion and notify
+      - name: Watch Notion and Telegram (every minute, ~55 min)
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: python notion_watch.py
-
-      - name: Group photo
-        env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: python group_photo.py || true
+        run: |
+          end=$((SECONDS + 55*60))
+          while [ $SECONDS -lt $end ]; do
+            python notion_watch.py || echo "check failed, retrying next minute"
+            python group_photo.py || true
+            sleep 60
+          done
 
       - name: Save state
-        if: hashFiles('state.enc') != ''
+        if: always() && hashFiles('state.enc') != ''
         uses: actions/cache/save@v4
         with:
           path: state.enc
           key: state-${{ github.run_id }}-${{ github.run_attempt }}
 
+      - name: Start next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run notion-watch.yml --repo "$GITHUB_REPOSITORY" --ref main
+
       - name: Drop old state caches
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -61,6 +70,7 @@ jobs:
             | xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY" || true
 
       - name: Keep schedule alive (GitHub pauses idle schedules after 60 days)
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/notion-watch.yml/enable" || true
