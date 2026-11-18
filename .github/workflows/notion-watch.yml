@@ -1,6 +1,6 @@
 name: notion-watch
 
-# One run stays alive ~55 min, checking Notion and Telegram commands every minute,
+# One run stays alive ~55 min, answering Telegram (buttons, tasks for Claude),
 # then starts the next run itself. The schedule only restarts the chain if it ever breaks.
 on:
   schedule:
@@ -36,17 +36,11 @@ jobs:
           key: state-${{ github.run_id }}
           restore-keys: state-
 
-      - name: Watch Notion and Telegram (every minute, ~55 min)
+      - name: Telegram bot (long polling, ~55 min)
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: |
-          end=$((SECONDS + 55*60))
-          while [ $SECONDS -lt $end ]; do
-            python notion_watch.py || echo "check failed, retrying next minute"
-            python group_photo.py || true
-            sleep 60
-          done
+        run: python bot.py || echo "bot stopped, next run restarts it"
 
       - name: Save state
         if: always() && hashFiles('state.enc') != ''
